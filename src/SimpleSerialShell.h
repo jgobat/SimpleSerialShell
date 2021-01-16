@@ -22,17 +22,23 @@ class SimpleSerialShell : public Stream {
         typedef int (*CommandFunction)(int, char ** );
         //
         //void addCommand(const char * name, CommandFunction f);
-        void addCommand(const __FlashStringHelper * name, CommandFunction f);
+        void addCommand(const __FlashStringHelper * name, CommandFunction f, boolean g, const __FlashStringHelper *usage);
 
         void attach(Stream & shellSource);
+        void addFallback(int (*fb)(int argc, char **argv));
+        void addStrings(char *(*stringVar)(char *arg));
+        void addFloats(float (*floatVar)(char *arg));
+        void addRedirector(Stream *(*redirect)(Stream *c, SdFile *f));
+        void addSD(SdFat *s);
 
         // check for a complete command and run it if available
         // non blocking
         bool executeIfInput(void);  // returns true when command attempted
         int lastErrNo(void);
 
+        char **glob(SdFat *, char *, int *);
         int execute( const char aCommandString[]);  // shell.execute("echo hello world");
-
+        int split(char *, char **, int);
         static int printHelp(int argc, char **argv);
 
         void resetBuffer(void);
@@ -51,7 +57,7 @@ class SimpleSerialShell : public Stream {
         Stream * shellConnection;
         int m_lastErrNo;
         int execute(void);
-        int execute(int argc, char** argv);
+        // int execute(int argc, char** argv);
 
         bool prepInput(void);
 
@@ -60,7 +66,11 @@ class SimpleSerialShell : public Stream {
         static const char MAXARGS = 10;
         char linebuffer[BUFSIZE];
         int inptr;
-
+        int (*fallback)(int argc, char **argv);
+        char *(*stringExpand)(char *name);
+        float (*floatExpand)(char *name);
+        SdFat *sd;
+        Stream *(*consoleChange)(Stream *c, SdFile *f);
         class Command;
         static Command * firstCommand;
 };

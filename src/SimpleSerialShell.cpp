@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <fnmatch.h>
+#include <SdFat.h>
 #include <SimpleSerialShell.h>
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -8,6 +10,8 @@
  *  Implementation for the shell.
  *
  */
+
+
 
 SimpleSerialShell shell;
 
@@ -20,8 +24,8 @@ SimpleSerialShell::Command * SimpleSerialShell::firstCommand = NULL;
  */
 class SimpleSerialShell::Command {
     public:
-        Command(const __FlashStringHelper * n, CommandFunction f):
-            name(n), myFunc(f) {};
+        Command(const __FlashStringHelper * n, CommandFunction f, boolean g, const __FlashStringHelper *u):
+            name(n), myFunc(f), glob(g), usage(u) {};
 
         int execute(int argc, char **argv)
         {
@@ -45,6 +49,8 @@ class SimpleSerialShell::Command {
         const __FlashStringHelper * name;
         CommandFunction myFunc;
         Command * next;
+        boolean glob;
+        const __FlashStringHelper *usage;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -53,16 +59,53 @@ SimpleSerialShell::SimpleSerialShell()
       m_lastErrNo(EXIT_SUCCESS)
 {
     resetBuffer();
+    addFallback(NULL);
+    addStrings(NULL);
+    addFloats(NULL);
+    addRedirector(NULL);
+    addSD(NULL);
 
     // simple help.
-    addCommand(F("help"), SimpleSerialShell::printHelp);
+    addCommand(F("help"), SimpleSerialShell::printHelp, false, NULL);
 };
 
+char **SimpleSerialShell::glob(SdFat *sd, char *spec, int *n)
+{
+    SdFile root;
+    SdFile entry;
+    char   buff[16];
+    int n_match = 0;
+    char **matches = NULL;
+
+    *n = 0;
+    if (!sd) 
+        return NULL;
+        
+    sd -> vol()->cwd(buff, 16);
+    
+    if (!root.open(buff)) {
+        return NULL;
+    }    
+
+    while (entry.openNext(&root, O_RDONLY)) {   
+        entry.getName(buff, 16);  
+
+        if (fnmatch(spec, buff, 0) == 0) {
+            matches = (char **) realloc(matches, sizeof(char *)*(n_match + 1));
+            matches[n_match ++] = strndup(buff, 16);
+        }
+        entry.close();
+    }
+    root.close();
+
+    *n = n_match;
+    return matches;
+}
 //////////////////////////////////////////////////////////////////////////////
 void SimpleSerialShell::addCommand(
-    const __FlashStringHelper * name, CommandFunction f)
+    const __FlashStringHelper * name, CommandFunction f, boolean g, const __FlashStringHelper *u)
 {
-    auto * newCmd = new Command(name, f);
+    auto * newCmd = new Command(name, f, g, u);
 
     // insert in list alphabetically
     // from stackoverflow...
@@ -78,6 +121,30 @@ void SimpleSerialShell::addCommand(
     newCmd->next = temp2;
 }
 
+void SimpleSerialShell::addFallback(int (*fb)(int argc, char **argv))
+{
+    fallback = fb;
+}
+
+void SimpleSerialShell::addStrings(char *(*s)(char *argv))
+{
+    stringExpand = s;
+}
+
+void SimpleSerialShell::addFloats(float (*s)(char *argv))
+{
+    floatExpand = s;
+}
+
+void SimpleSerialShell::addRedirector(Stream *(*f)(Stream *c, SdFile *f))
+{
+    consoleChange = f;
+}
+
+void SimpleSerialShell::addSD(SdFat *s)
+{
+    sd = s;
+}
 //////////////////////////////////////////////////////////////////////////////
 bool SimpleSerialShell::executeIfInput(void)
 {
@@ -178,56 +245,178 @@ int SimpleSerialShell::execute(const char commandString[])
     return execute();
 }
 
+int SimpleSerialShell::split(char *buffer, char **argv, int max_argv)
+{
+    char *p, *start_of_word;
+    int c;
+    enum states { REGULAR, IN_WORD, IN_STRING } state = REGULAR;
+    int argc = 0;
+
+    for (p = buffer; argc < max_argv && *p != '\0'; p++) {
+        c = (unsigned char) *p;
+        switch (state) {
+        case REGULAR:
+            if (isspace(c)) {
+                continue;
+            }
+
+            if (c == '"') {
+                state = IN_STRING;
+                start_of_word = p + 1;
+                continue;
+            }
+            state = IN_WORD;
+            start_of_word = p;
+            continue;
+
+        case IN_STRING:
+            if (c == '"') {
+                *p = 0;
+                argv[argc++] = start_of_word;
+                state = REGULAR;
+            }
+            continue;
+
+        case IN_WORD:
+            if (isspace(c)) {
+                *p = 0;
+                argv[argc++] = start_of_word;
+                state = REGULAR;
+            }
+            continue;
+        }
+    }
+
+    if (state != REGULAR && argc < max_argv)
+        argv[argc++] = start_of_word;
+
+    return argc;
+
+}
 //////////////////////////////////////////////////////////////////////////////
 int SimpleSerialShell::execute(void)
 {
     char * argv[MAXARGS] = {0};
-    linebuffer[BUFSIZE - 1] = '\0'; // play it safe
     int argc = 0;
+    char *raw_argv[MAXARGS] = {0};
+    int raw_argc = 0;
+    char *ptr;
+    float f;
+    SdFile redir;
+    Stream *consoleSave = NULL;
+    boolean redirOk = false;
+    boolean append;
+    char **matches = NULL;
+    int    n_matches = 0;
+    char * catName;
+    Command *aCmd = NULL;
+    char **floats = NULL;
+    int    i, j, nfloats = 0;
+    char  *anArg;
 
-    char * rest = NULL;
-    const char * whitespace = " \t\r\n";
-    char * commandName = strtok_r(linebuffer, whitespace, &rest);
+    linebuffer[BUFSIZE - 1] = '\0'; // play it safe
 
-    if (!commandName)
+    raw_argc = split(linebuffer, raw_argv, MAXARGS);
+
+    if (raw_argc == 0)
     {
         // empty line; no arguments found.
         println(F("OK"));
         resetBuffer();
         return EXIT_SUCCESS;
     }
-    argv[argc++] = commandName;
+    argv[argc++] = raw_argv[0];
 
-    for ( ; argc < MAXARGS; )
-    {
-        char * anArg = strtok_r(0, whitespace, &rest);
-        if (anArg) {
-            argv[argc++] = anArg;
-        } else {
-            // no more arguments
-            return execute(argc, argv);
-        }
-    }
-
-    return report(F("Too many arguments to parse"), -1);
-}
-
-//////////////////////////////////////////////////////////////////////////////
-int SimpleSerialShell::execute(int argc, char **argv)
-{
     m_lastErrNo = 0;
-    for ( Command * aCmd = firstCommand; aCmd != NULL; aCmd = aCmd->next) {
+    for ( aCmd = firstCommand; aCmd != NULL; aCmd = aCmd->next) {
         if (aCmd->compareName(argv[0]) == 0) {
-            m_lastErrNo = aCmd->execute(argc, argv);
-            resetBuffer();
-            return m_lastErrNo;
+            break;
         }
     }
-    print(F("\""));
-    print(argv[0]);
-    print(F("\": "));
 
-    return report(F("command not found"), -1);
+    if (aCmd == NULL && fallback && (m_lastErrNo = fallback(argc, argv)) == 0) {
+        resetBuffer();
+        return m_lastErrNo;
+    }
+    
+    if (aCmd == NULL) {
+        print(F("\""));
+        print(argv[0]);
+        print(F("\": "));
+
+        return report(F("command not found"), -1);
+    }
+
+    // TODO: handle quoted args, glob (fnmatch), variable expansion, redirection
+    for (j = 1 ; j < raw_argc && argc < MAXARGS ; j++)
+    {
+        anArg = raw_argv[j];
+        if (aCmd -> glob && (strchr(anArg, '*') || strchr(anArg, '?'))) {
+            matches = glob(sd, anArg, &n_matches);
+            for (i = 0 ; i < n_matches && argc < MAXARGS ; i++) {
+                argv[argc++] = matches[i];
+            }    
+        }
+        else if (anArg[0] == '>' && j < raw_argc - 1) {
+            append = strstr(anArg, ">>") ? true : false;
+            catName = raw_argv[++ j];
+            redirOk = redir.open(catName, append ? O_WRITE | O_CREAT | O_AT_END : O_WRITE | O_CREAT);
+        }
+        else if (anArg[0] == '_' && floatExpand) {
+            f = floatExpand(anArg + 1);
+            if (f == NAN) {
+                argv[argc++] = NULL; // or empty string?
+            }
+            else {
+                floats = (char **) realloc(floats, sizeof(char *)*(nfloats + 1));
+                floats[nfloats] = (char *) malloc(sizeof(char) * 12);
+                snprintf(floats[nfloats], 10, "%f", f);
+                argv[argc++] = floats[nfloats];
+                nfloats ++;
+            }    
+        }
+        else if (anArg[0] == '$' && stringExpand) {
+            if ((ptr = stringExpand(anArg + 1)) != NULL)
+                argv[argc++] = ptr;
+            else
+                argv[argc++] = NULL; // or empty string??
+        }
+        else if (anArg) {
+            argv[argc++] = anArg;
+        } 
+        else {
+            println("uh oh");
+            // uh oh?
+        }
+    }
+    // no more arguments - set redirect if set and execute
+    if (redirOk && consoleChange) {
+        consoleSave = consoleChange(NULL, &redir);
+    }
+    m_lastErrNo = aCmd->execute(argc, argv);
+    resetBuffer();
+    
+    // restore redirect
+    if (redirOk && consoleChange) {
+        consoleChange(consoleSave, NULL);
+        redir.close();
+    }
+
+    // cleanup memory
+    for(i = 0 ; i < nfloats ; i++)
+        free(floats[i]);
+
+    if (nfloats)
+        free(floats);
+
+    for (i = 0 ; i < n_matches ; i++)
+        free(matches[i]);
+
+    if (n_matches)
+        free(matches);
+
+    return m_lastErrNo;
+  
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -270,7 +459,10 @@ int SimpleSerialShell::printHelp(int argc, char **argv)
     while (aCmd)
     {
         shell.print(F("  "));
-        shell.println(aCmd->name);
+        shell.print(aCmd->name);
+        shell.print(F("  "));
+        shell.println(aCmd->usage);
+
         aCmd = aCmd->next;
     }
     return 0;	// OK or "no errors"
