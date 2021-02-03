@@ -22,7 +22,7 @@ class SimpleSerialShell : public Stream {
         typedef int (*CommandFunction)(int, char ** );
         //
         //void addCommand(const char * name, CommandFunction f);
-        void addCommand(const __FlashStringHelper * name, CommandFunction f, boolean g, const __FlashStringHelper *usage);
+        void addCommand(const __FlashStringHelper * name, CommandFunction f, boolean g, boolean expand, const __FlashStringHelper *usage);
 
         void attach(Stream & shellSource);
         void addFallback(int (*fb)(int argc, char **argv));
@@ -61,7 +61,6 @@ class SimpleSerialShell : public Stream {
 
         bool prepInput(void);
 
-        int report(const __FlashStringHelper * message, int errorCode);
         static const char BUFSIZE = 88;
         static const char MAXARGS = 10;
         char linebuffer[BUFSIZE];

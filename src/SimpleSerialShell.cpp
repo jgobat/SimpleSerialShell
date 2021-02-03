@@ -2,6 +2,8 @@
 #include <fnmatch.h>
 #include <SdFat.h>
 #include <SimpleSerialShell.h>
+#include <printf.h>
+#include "editline.h"
 
 ////////////////////////////////////////////////////////////////////////////////
 /*!
@@ -10,7 +12,6 @@
  *  Implementation for the shell.
  *
  */
-
 
 
 SimpleSerialShell shell;
@@ -24,8 +25,8 @@ SimpleSerialShell::Command * SimpleSerialShell::firstCommand = NULL;
  */
 class SimpleSerialShell::Command {
     public:
-        Command(const __FlashStringHelper * n, CommandFunction f, boolean g, const __FlashStringHelper *u):
-            name(n), myFunc(f), glob(g), usage(u) {};
+        Command(const __FlashStringHelper * n, CommandFunction f, boolean g, boolean e, const __FlashStringHelper *u):
+            name(n), myFunc(f), glob(g), expand(e), usage(u) {};
 
         int execute(int argc, char **argv)
         {
@@ -50,6 +51,7 @@ class SimpleSerialShell::Command {
         CommandFunction myFunc;
         Command * next;
         boolean glob;
+        boolean expand;
         const __FlashStringHelper *usage;
 };
 
@@ -66,7 +68,7 @@ SimpleSerialShell::SimpleSerialShell()
     addSD(NULL);
 
     // simple help.
-    addCommand(F("help"), SimpleSerialShell::printHelp, false, NULL);
+    addCommand(F("help"), SimpleSerialShell::printHelp, false, false, NULL);
 };
 
 char **SimpleSerialShell::glob(SdFat *sd, char *spec, int *n)
@@ -103,9 +105,9 @@ char **SimpleSerialShell::glob(SdFat *sd, char *spec, int *n)
 }
 //////////////////////////////////////////////////////////////////////////////
 void SimpleSerialShell::addCommand(
-    const __FlashStringHelper * name, CommandFunction f, boolean g, const __FlashStringHelper *u)
+    const __FlashStringHelper * name, CommandFunction f, boolean g, boolean e, const __FlashStringHelper *u)
 {
-    auto * newCmd = new Command(name, f, g, u);
+    auto * newCmd = new Command(name, f, g, e, u);
 
     // insert in list alphabetically
     // from stackoverflow...
@@ -148,6 +150,19 @@ void SimpleSerialShell::addSD(SdFat *s)
 //////////////////////////////////////////////////////////////////////////////
 bool SimpleSerialShell::executeIfInput(void)
 {
+    bool didSomething = false;
+    char *line;
+
+    line = readline();
+    if (line) {
+        didSomething = true;
+        strcpy(linebuffer, line);
+        execute();
+        add_history(line);
+        resetline("> ");
+    }
+
+    /*
     bool bufferReady = prepInput();
     bool didSomething = false;
 
@@ -157,12 +172,14 @@ bool SimpleSerialShell::executeIfInput(void)
     }
 
     return didSomething;
+    */
 }
 
 //////////////////////////////////////////////////////////////////////////////
 void SimpleSerialShell::attach(Stream & requester)
 {
     shellConnection = &requester;
+    resetline("> ");
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -334,24 +351,11 @@ int SimpleSerialShell::execute(void)
         }
     }
 
-    if (aCmd == NULL && fallback && (m_lastErrNo = fallback(argc, argv)) == 0) {
-        resetBuffer();
-        return m_lastErrNo;
-    }
-    
-    if (aCmd == NULL) {
-        print(F("\""));
-        print(argv[0]);
-        print(F("\": "));
-
-        return report(F("command not found"), -1);
-    }
-
     // TODO: handle quoted args, glob (fnmatch), variable expansion, redirection
     for (j = 1 ; j < raw_argc && argc < MAXARGS ; j++)
     {
         anArg = raw_argv[j];
-        if (aCmd -> glob && (strchr(anArg, '*') || strchr(anArg, '?'))) {
+        if (aCmd && aCmd -> glob && (strchr(anArg, '*') || strchr(anArg, '?'))) {
             matches = glob(sd, anArg, &n_matches);
             for (i = 0 ; i < n_matches && argc < MAXARGS ; i++) {
                 argv[argc++] = matches[i];
@@ -362,7 +366,7 @@ int SimpleSerialShell::execute(void)
             catName = raw_argv[++ j];
             redirOk = redir.open(catName, append ? O_WRITE | O_CREAT | O_AT_END : O_WRITE | O_CREAT);
         }
-        else if (anArg[0] == '_' && floatExpand) {
+        else if (aCmd && aCmd -> expand && anArg[0] == '_' && floatExpand) {
             f = floatExpand(anArg + 1);
             if (f == NAN) {
                 argv[argc++] = NULL; // or empty string?
@@ -375,7 +379,7 @@ int SimpleSerialShell::execute(void)
                 nfloats ++;
             }    
         }
-        else if (anArg[0] == '$' && stringExpand) {
+        else if (aCmd && aCmd -> expand && anArg[0] == '$' && stringExpand) {
             if ((ptr = stringExpand(anArg + 1)) != NULL)
                 argv[argc++] = ptr;
             else
@@ -393,9 +397,18 @@ int SimpleSerialShell::execute(void)
     if (redirOk && consoleChange) {
         consoleSave = consoleChange(NULL, &redir);
     }
-    m_lastErrNo = aCmd->execute(argc, argv);
+
+    if (aCmd == NULL && fallback && (m_lastErrNo = fallback(argc, argv)) == 0) {
+        //
+    }
+    else if (aCmd == NULL) {
+        printf("\"%s\" command not found\n", argv[0]);
+    }
+    else {
+        m_lastErrNo = aCmd->execute(argc, argv);
+    }
     resetBuffer();
-    
+
     // restore redirect
     if (redirOk && consoleChange) {
         consoleChange(consoleSave, NULL);
@@ -425,22 +438,7 @@ int SimpleSerialShell::lastErrNo(void)
     return m_lastErrNo;
 }
 
-//////////////////////////////////////////////////////////////////////////////
-int SimpleSerialShell::report(const __FlashStringHelper * constMsg, int errorCode)
-{
-    if (errorCode != EXIT_SUCCESS)
-    {
-        String message(constMsg);
-        print(errorCode);
-        if (message[0] != '\0') {
-            print(F(": "));
-            println(message);
-        }
-    }
-    resetBuffer();
-    m_lastErrNo = errorCode;
-    return errorCode;
-}
+
 //////////////////////////////////////////////////////////////////////////////
 void SimpleSerialShell::resetBuffer(void)
 {
